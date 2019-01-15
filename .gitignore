@@ -2,6 +2,7 @@
 
 # C extensions
 /dpark/portable_hash.c
+/dpark/utils/recursion.c
 *.so
 
 # Packages
@@ -16,6 +17,8 @@ var
 sdist
 develop-eggs
 .installed.cfg
+.eggs
+.cache
 lib
 lib64
 
@@ -26,9 +29,13 @@ pip-log.txt
 .coverage
 .tox
 nosetests.xml
+.pytest_cache
 
 #Translations
 *.mo
 
 #Mr Developer
 .mr.developer.cfg
+
+# Pycharm
+.idea

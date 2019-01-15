@@ -1,25 +1,45 @@
+from __future__ import absolute_import
+from __future__ import print_function
 import os
 import time
 import socket
 import shutil
 import itertools
 import threading
-import logging
 import random
 from functools import reduce
 from collections import deque
+from contextlib import closing
+import six
+from six.moves import range
+
 try:
-    import cPickle as pickle
+    import six.moves.cPickle as pickle
 except ImportError:
     import pickle
 
-from dpark.util import spawn, atomic_file
+from dpark.utils import spawn, atomic_file
+from dpark.utils.log import get_logger
 from dpark.serialize import load_func, dump_func
 from dpark.dependency import Partitioner, HashPartitioner, Aggregator
 from dpark.context import DparkContext
 from dpark.rdd import CoGroupedRDD, CheckpointRDD
+from dpark.file_manager import open_file
+from dpark.file_manager.utils import Error
 
-logger = logging.getLogger(__name__)
+try:
+    from scribe.scribe import Iface, ResultCode, Processor
+    from thrift.protocol import TBinaryProtocol
+    from thrift.transport import TSocket
+    from thrift.server import TNonblockingServer
+    from collections import deque
+    from kazoo.client import KazooClient
+
+    WITH_SCRIBE = True
+except:
+    WITH_SCRIBE = False
+
+logger = get_logger(__name__)
 
 
 class Interval(object):
@@ -52,7 +72,7 @@ class Interval(object):
     def current(cls, duration):
         now = int(time.time())
         ss = int(duration)
-        begin = now / ss * ss
+        begin = now // ss * ss
         return cls(begin, begin + duration)
 
 
@@ -66,7 +86,7 @@ class DStreamGraph(object):
         self.rememberDuration = None
 
     def start(self, time):
-        self.zeroTime = int(time / self.batchDuration) * self.batchDuration
+        self.zeroTime = int(time // self.batchDuration) * self.batchDuration
         for out in self.outputStreams:
             out.remember(self.rememberDuration)
         for ins in self.inputStreams:
@@ -95,8 +115,8 @@ class DStreamGraph(object):
         self.outputStreams.append(output)
 
     def generateRDDs(self, time):
-        return filter(None, [out.generateJob(time)
-                             for out in self.outputStreams])
+        return [_f for _f in [out.generateJob(time)
+                              for out in self.outputStreams] if _f]
 
     def forgetOldRDDs(self, time):
         for out in self.outputStreams:
@@ -117,6 +137,8 @@ class StreamingContext(object):
         if isinstance(sc, str) or not sc:  # None
             sc = DparkContext(sc)
         self.sc = sc
+        sc.is_dstream = True
+
         batchDuration = int(batchDuration)
         self.batchDuration = batchDuration
         self.graph = graph or DStreamGraph(batchDuration)
@@ -127,10 +149,12 @@ class StreamingContext(object):
         self.batchCallback = batchCallback
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, sc=None):
         cp = Checkpoint.read(path)
         graph = cp.graph
-        ssc = cls(cp.batchDuration, cp.master, graph)
+        if not sc:
+            sc = cp.master
+        ssc = cls(cp.batchDuration, sc, graph)
         ssc.checkpointDir = path
         ssc.checkpointDuration = cp.checkpointDuration
         graph.setContext(ssc)
@@ -158,6 +182,14 @@ class StreamingContext(object):
         self.registerInputStream(ds)
         return ds
 
+    def scribeTextStream(self, zk_address, zk_path):
+        if WITH_SCRIBE:
+            ds = ScribeInputDStream(self, zk_address, zk_path, category='default')
+            self.registerInputStream(ds)
+            return ds
+        else:
+            raise RuntimeError('No scribed env supported')
+
     def customStream(self, func):
         ds = NetworkInputDStream(self, func)
         self.registerInputStream(ds)
@@ -171,6 +203,11 @@ class StreamingContext(object):
         explicitly.
         """
         ds = FileInputDStream(self, directory, filter, newFilesOnly, oldThreshold)
+        self.registerInputStream(ds)
+        return ds
+
+    def rotatingfiles(self, files):
+        ds = RotatingFilesInputDStream(self, files)
         self.registerInputStream(ds)
         return ds
 
@@ -218,7 +255,7 @@ class StreamingContext(object):
         except KeyboardInterrupt:
             pass
         finally:
-            self.sc.stop()
+            #  self.sc.stop()
             logger.info("StreamingContext stopped successfully")
 
     def stop(self):
@@ -250,7 +287,7 @@ class Checkpoint(object):
     @classmethod
     def read(cls, path):
         filename = os.path.join(path, 'metadata')
-        with open(filename) as f:
+        with open(filename, 'rb') as f:
             return pickle.loads(f.read())
 
 
@@ -291,7 +328,7 @@ class RecurringTimer(object):
         self.stopped = False
 
     def start(self, start):
-        self.nextTime = (int(start / self.period) + 1) * self.period
+        self.nextTime = (int(start // self.period) + 1) * self.period
         self.stopped = False
         self.thread = spawn(self.run)
         logger.debug("RecurringTimer started, nextTime is %d", self.nextTime)
@@ -312,7 +349,8 @@ class RecurringTimer(object):
             else:
                 time.sleep(max(min(self.nextTime - now, 1), 0.01))
 
-_STOP, _EVENT = range(2)
+
+_STOP, _EVENT = list(range(2))
 
 
 class Scheduler(object):
@@ -421,14 +459,14 @@ class DStream(object):
             dep.setGraph(g)
 
     def remember(self, duration):
-        if duration and duration > self.rememberDuration:
+        if duration and (self.rememberDuration is None or duration > self.rememberDuration):
             self.rememberDuration = duration
         for dep in self.dependencies:
             dep.remember(self.parentRememberDuration)
 
     def isTimeValid(self, t):
         d = (t - self.zeroTime)
-        dd = d / self.slideDuration * self.slideDuration
+        dd = d // self.slideDuration * self.slideDuration
         return abs(d - dd) < 1e-3
 
     def compute(self, time):
@@ -454,7 +492,7 @@ class DStream(object):
 
     def forgetOldRDDs(self, time):
         oldest = time - (self.rememberDuration or 0)
-        for k in self.generatedRDDs.keys():
+        for k in list(self.generatedRDDs.keys()):
             if k < oldest:
                 self.generatedRDDs.pop(k)
         for dep in self.dependencies:
@@ -467,7 +505,7 @@ class DStream(object):
         if newRdds:
             oldRdds = self.checkpointData
             self.checkpointData = dict(newRdds)
-            for t, p in oldRdds.iteritems():
+            for t, p in six.iteritems(oldRdds):
                 if t not in self.checkpointData:
                     try:
                         shutil.rmtree(p)
@@ -483,7 +521,7 @@ class DStream(object):
             len(newRdds))
 
     def restoreCheckpointData(self):
-        for t, path in self.checkpointData.iteritems():
+        for t, path in six.iteritems(self.checkpointData):
             self.generatedRDDs[t] = CheckpointRDD(self.ssc.sc, path)
         for dep in self.dependencies:
             dep.restoreCheckpointData()
@@ -539,14 +577,15 @@ class DStream(object):
     def show(self):
         def forFunc(rdd, t):
             some = rdd.take(11)
-            print "-" * 80
-            print "Time:", time.asctime(time.localtime(t))
-            print "-" * 80
+            print("-" * 80)
+            print("Time:", time.asctime(time.localtime(t)))
+            print("-" * 80)
             for i in some[:10]:
-                print i
+                print(i)
             if len(some) > 10:
-                print '...'
-            print
+                print('...')
+            print()
+
         return self.foreach(forFunc)
 
     def window(self, duration, slideDuration=None):
@@ -625,6 +664,7 @@ class DStream(object):
                 nr = func(vs, r)
                 if nr is not None:
                     yield (k, nr)
+
         return StateDStream(self, newF, partitioner, remember)
 
     def mapValues(self, func):
@@ -771,7 +811,7 @@ class UnionDStream(DStream):
         self.slideDuration = parents[0].slideDuration
 
     def compute(self, t):
-        rdds = filter(None, [p.getOrCompute(t) for p in self.parents])
+        rdds = [_f for _f in [p.getOrCompute(t) for p in self.parents] if _f]
         if rdds:
             return self.ssc.sc.union(rdds)
 
@@ -809,7 +849,7 @@ class CoGroupedDStream(DStream):
         self.slideDuration = parents[0].slideDuration
 
     def compute(self, t):
-        rdds = filter(None, [p.getOrCompute(t) for p in self.parents])
+        rdds = [_f for _f in [p.getOrCompute(t) for p in self.parents] if _f]
         if rdds:
             return CoGroupedRDD(rdds, self.partitioner)
 
@@ -847,6 +887,16 @@ class ReducedWindowedDStream(DerivedDStream):
             return self.windowDuration + self.rememberDuration
         # persist
 
+    def __getstate__(self):
+        d = DerivedDStream.__getstate__(self)
+        del d['invfunc']
+        d['_invfunc'] = dump_func(self.func)
+        return d
+
+    def __setstate__(self, state):
+        self.invfunc = load_func(state.pop('_invfunc'))
+        DerivedDStream.__setstate__(self, state)
+
     def compute(self, t):
         if t <= self.zeroTime:
             return
@@ -881,6 +931,7 @@ class ReducedWindowedDStream(DerivedDStream):
                 if newValues:
                     tmp = reduceF(tmp, reduce(reduceF, newValues))
                 return tmp
+
         return cogroupedRDD.mapValue(mergeValues)
 
 
@@ -992,6 +1043,63 @@ class FileInputDStream(InputDStream):
                     self.filter(os.path.join(root, name))
 
 
+class RotatingFilesInputDStream(InputDStream):
+    def __init__(self, ssc, files):
+        InputDStream.__init__(self, ssc)
+        self.files = files
+        self._state = {}
+
+    def start(self):
+        self._state = dict(self._get_state())
+
+    def _get_state(self):
+        for fn in self.files:
+            try:
+                realname = os.path.realpath(fn)
+                with closing(open_file(realname)) as f:
+                    if f:
+                        yield realname, (f.info.inode, f.info.length, f.info.mtime)
+                    else:
+                        st = os.stat(realname)
+                        yield realname, (st.st_ino, st.st_size, st.st_mtime)
+
+            except (OSError, Error):
+                pass
+
+    def compute(self, validTime):
+        state = {}
+        offsets = {}
+
+        for fn, (inode, size, mtime) in self._get_state():
+            if fn not in self._state:
+                offsets[fn] = (0, size)
+            else:
+                _inode, _size, _mtime = self._state[fn]
+                if inode != _inode or (mtime > _mtime and size < _size):
+                    offsets[fn] = (0, size)
+                elif mtime >= _mtime and size > _size:
+                    offsets[fn] = (_size, size)
+
+            state[fn] = (inode, size, mtime)
+
+        for fn, (_inode, _size, _mtime) in six.iteritems(self._state):
+            if fn not in state:
+                try:
+                    st = os.stat(fn)
+                    inode, size, mtime = st.st_ino, st.st_size, st.st_mtime
+                except OSError:
+                    continue
+
+                if inode != _inode or (mtime > _mtime and size < _size):
+                    offsets[fn] = (0, size)
+                elif mtime >= _mtime and size > _size:
+                    offsets[fn] = (_size, size)
+
+        self._state = state
+        return self.ssc.sc.union([self.ssc.sc.partialTextFile(path, begin, end)
+                                  for path, (begin, end) in six.iteritems(offsets)])
+
+
 class QueueInputDStream(InputDStream):
 
     def __init__(self, ssc, queue, oneAtAtime=True, defaultRDD=None):
@@ -1089,3 +1197,73 @@ class SocketInputDStream(NetworkInputDStream):
                 f.close()
             if client:
                 client.close()
+
+
+if WITH_SCRIBE:
+    class ScribeHandler(Iface):
+        def __init__(self, buf_que):
+            self.buf_que = buf_que
+
+        def Log(self, messages):
+            try:
+                for m in messages:
+                    self.buf_que.append(m.message)
+            except:
+                logger.exception('push message failed')
+                raise
+            return ResultCode.OK
+
+
+    class ScribeInputDStream(NetworkInputDStream):
+        def __init__(self, ssc, zk_address, zk_path, category='default'):
+            NetworkInputDStream.__init__(self, ssc, self._receive)
+            self.zk_address = zk_address
+            self.zk_path = zk_path
+            self.category = category
+
+        def __getstate__(self):
+            d = InputDStream.__getstate__(self)
+            del d['func']
+            del d['_lock']
+
+        def __setstate__(self, state):
+            self.func = self._receive
+            self._lock = threading.RLock()
+            InputDStream.__setstate__(self, state)
+
+        def _createThriftServer(self):
+            buf_que = deque()
+            handler = ScribeHandler(buf_que)
+            protocol_factory = TBinaryProtocol.TBinaryProtocolFactory(False, False)
+            transport = TSocket.TServerSocket(host='0.0.0.0')
+            processor = Processor(handler)
+            server = TNonblockingServer.TNonblockingServer(processor, transport,
+                                                           protocol_factory)
+            server._stop = False
+            while True:
+                try:
+                    server.prepare()
+                    port = transport.handle.getsockname()[1]
+                    logger.info('get scribe port succeed: %d', port)
+                    break
+                except socket.error:
+                    pass
+            spawn(server.serve)
+            return server, port, buf_que
+
+        def _receive(self):
+            server, port, buf_que = self._createThriftServer()
+
+            kazoo_client = KazooClient(self.zk_address)
+            kazoo_client.start()
+            path = '%s/%s:%d' % (self.zk_path, socket.gethostname(), port)
+            kazoo_client.create(path, ephemeral=True, makepath=True)
+
+            while not server._stop:
+                try:
+                    message = buf_que.pop()
+                    yield message
+                except:
+                    time.sleep(0.1)
+            server.close()
+            kazoo_client.close()

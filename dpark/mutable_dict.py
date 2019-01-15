@@ -1,15 +1,16 @@
-import uuid
+from __future__ import absolute_import
 import os
-import cPickle
-import urllib
+from six.moves import urllib, cPickle
 import struct
 import glob
-import uuid
+import uuid as uuid_pkg
 from dpark.env import env
-from dpark.util import compress, decompress, mkdir_p, atomic_file
+from dpark.utils import compress, decompress, mkdir_p, atomic_file
 from dpark.tracker import GetValueMessage, AddItemMessage
 from dpark.dependency import HashPartitioner
 from collections import OrderedDict
+import six
+
 
 class LRUDict(object):
     def __init__(self, limit=None):
@@ -31,15 +32,18 @@ class LRUDict(object):
 
 
 class ConflictValues(object):
-    def __init__(self, v=[]):
+    def __init__(self, v=None):
+        if v is None:
+            v = []
         self.value = list(v)
 
     def __repr__(self):
         return '<ConflictValues %s>' % self.value
 
+
 class MutableDict(object):
-    def __init__(self, partition_num , cacheLimit=None):
-        self.uuid = str(uuid.uuid4())
+    def __init__(self, partition_num, cacheLimit=None):
+        self.uuid = str(uuid_pkg.uuid4())
         self.partitioner = HashPartitioner(partition_num)
         self.data = LRUDict(cacheLimit)
         self.cacheLimit = cacheLimit
@@ -49,7 +53,7 @@ class MutableDict(object):
         self.is_local = True
 
     def __getstate__(self):
-        return (self.uuid, self.partitioner, self.generation, self.cacheLimit)
+        return self.uuid, self.partitioner, self.generation, self.cacheLimit
 
     def __setstate__(self, v):
         self.uuid, self.partitioner, self.generation, self.cacheLimit = v
@@ -66,10 +70,10 @@ class MutableDict(object):
         _key = self._get_key(key)
         values = self.data.get((_key, key))
         if values is None:
-            for k, v in self._fetch_missing(_key).iteritems():
+            for k, v in six.iteritems(self._fetch_missing(_key)):
                 self.data.put((_key, k), v)
-
-            values = self.data.get((_key, key))
+                if k == key:
+                    values = v
 
         return values[0] if values is not None else None
 
@@ -88,17 +92,17 @@ class MutableDict(object):
         uri = env.get('SERVER_URI')
         server_uri = '%s/%s' % (uri, os.path.basename(path))
 
-        for k,v in self.updated.items():
+        for k, v in self.updated.items():
             key = self._get_key(k)
             if key in updated_keys:
                 updated_keys[key][k] = v
             else:
-                updated_keys[key] = {k:v}
+                updated_keys[key] = {k: v}
 
-        uid = uuid.uuid4().get_hex()
+        uid = uuid_pkg.uuid4().get_hex()
         for key, updated in updated_keys.items():
             new = self._fetch_missing(key)
-            for k,v in updated.items():
+            for k, v in updated.items():
                 if v is None:
                     new.pop(k)
                 else:
@@ -112,13 +116,13 @@ class MutableDict(object):
             url = '%s/%s' % (server_uri, filename)
             with atomic_file(fn) as f:
                 data = compress(cPickle.dumps(new))
-                f.write(struct.pack('<I', len(data)+4) + data)
+                f.write(struct.pack('<I', len(data) + 4) + data)
 
             env.trackerClient.call(AddItemMessage('mutable_dict_new:%s' % key, url))
 
-            files = glob.glob(os.path.join(path, '%s-*' % self.uuid ))
+            files = glob.glob(os.path.join(path, '%s-*' % self.uuid))
             for f in files:
-                if int(f.split('_')[-2]) < self.generation -1:
+                if int(f.split('_')[-2]) < self.generation - 1:
                     try:
                         os.remove(f)
                     except OSError:
@@ -145,11 +149,12 @@ class MutableDict(object):
         self.updated.clear()
         self.data = LRUDict(self.cacheLimit)
 
-    def _fetch_missing(self, key):
+    @classmethod
+    def _fetch_missing(cls, key):
         result = {}
         urls = env.trackerClient.call(GetValueMessage('mutable_dict:%s' % key))
         for url in urls:
-            f = urllib.urlopen(url)
+            f = urllib.request.urlopen(url)
             if f.code is not None and f.code != 200:
                 raise IOError('Open %s failed:%s' % (url, f.code))
 
@@ -160,10 +165,10 @@ class MutableDict(object):
             length, = struct.unpack('<I', data[:4])
             if length != len(data):
                 raise IOError('Transfer %s failed: %s received, %s expected' % (url,
-                    len(data), length))
+                                                                                len(data), length))
 
             data = cPickle.loads(decompress(data[4:]))
-            for k,v in data.items():
+            for k, v in data.items():
                 if k in result:
                     r = result[k]
                     if v[1] == r[1]:
@@ -181,7 +186,7 @@ class MutableDict(object):
 
     def _get_key(self, key):
         return '%s-%s' % (self.uuid,
-                self.partitioner.getPartition(key))
+                          self.partitioner.getPartition(key))
 
     def _get_path(self):
         dirs = env.get('WORKDIR')
@@ -203,7 +208,7 @@ class MutableDict(object):
             try:
                 os.makedirs(p)
                 os.symlink(p, path)
-            except OSError, e:
+            except OSError:
                 pass
 
             return path
@@ -211,6 +216,7 @@ class MutableDict(object):
         raise RuntimeError('Cannot find suitable workdir')
 
     _all_mutable_dicts = {}
+
     @classmethod
     def register(cls, md):
         uuid = md.uuid
@@ -230,4 +236,3 @@ class MutableDict(object):
     def merge(cls):
         for md in cls._all_mutable_dicts.values():
             md._merge()
-

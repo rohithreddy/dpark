@@ -1,4 +1,4 @@
-import os
+from __future__ import absolute_import
 import atexit
 import optparse
 import signal
@@ -6,82 +6,177 @@ import logging
 import gc
 
 from dpark.rdd import *
+from dpark.utils.beansdb import restore_value
 from dpark.accumulator import Accumulator
-from dpark.schedule import LocalScheduler, MultiProcessScheduler, MesosScheduler
+from dpark.schedule import (
+    LocalScheduler, MultiProcessScheduler, MesosScheduler
+)
 from dpark.env import env
-from dpark.moosefs import walk
+from dpark.file_manager import walk
 from dpark.tabular import TabularRDD
-from dpark.util import memory_str_to_mb
+from dpark.utils import memory_str_to_mb
+from dpark.utils.log import init_dpark_logger, get_logger
+from dpark.utils.debug import spawn_rconsole
 import dpark.conf as conf
 from math import ceil
+import socket
+from six.moves import range
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+def is_gevent_monkey_patched():
+    try:
+        from gevent import monkey
+    except ImportError:
+        return False
+    else:
+        return bool(getattr(monkey, 'saved', False))
+
 
 def singleton(cls):
     instances = {}
+
     def getinstance(*a, **kw):
         key = (cls, tuple(a), tuple(sorted(kw.items())))
         if key not in instances:
+            if len(instances) >= 1:
+                logger.error('Too many DparkContext created!')
+
             instances[key] = cls(*a, **kw)
+
         return instances[key]
+
+    getinstance._instances = instances
     return getinstance
 
-def setup_conf(options):
-    if options.conf:
-        conf.load_conf(options.conf)
-    elif 'DPARK_CONF' in os.environ:
-        conf.load_conf(os.environ['DPARK_CONF'])
-    elif os.path.exists('/etc/dpark.conf'):
-        conf.load_conf('/etc/dpark.conf')
 
-    if options.mem is None:
-        options.mem = conf.MEM_PER_TASK
-    else:
-        options.mem = memory_str_to_mb(options.mem)
+_shutdown_handlers = []
 
-    conf.__dict__.update(os.environ)
-    import moosefs
-    moosefs.MFS_PREFIX = conf.MOOSEFS_MOUNT_POINTS
+
+def _shutdown():
+    started = len(_shutdown_handlers)
+    for handler in _shutdown_handlers:
+        try:
+            handler()
+        except Exception:
+            logger.exception('Faield to shutdown context')
+
+    _shutdown_handlers[:] = []
+    DparkContext._instances.clear()
+    if started:
+        logger.info("dpark shutdown.")
+
+
+atexit.register(_shutdown)
+_pid = os.getpid()
+_prev_handlers = {}
+_signals = [
+    signal.SIGINT, signal.SIGQUIT, signal.SIGTERM,
+    signal.SIGABRT, signal.SIGHUP
+]
+
+
+def _handler(signum, frame):
+    for sig, handler in _prev_handlers.items():
+        signal.signal(sig, handler)
+
+    if _pid == os.getpid():
+        # called on main process, will do cleanup
+        logger.error("got signal %d, exiting now...", signum)
+        _shutdown()
+
+    # resend signal to trigger previous handlers
+    _prev_handlers.clear()
+    os.kill(os.getpid(), signum)
+
+
+def register_sighandlers():
+    if not _prev_handlers:
+        for sig in _signals:
+            try:
+                _prev_handlers[sig] = signal.signal(sig, _handler)
+            except Exception:
+                logger.exception('Failed to register signal handler')
+
 
 @singleton
 class DparkContext(object):
     nextShuffleId = 0
+    options = None
+
     def __init__(self, master=None):
+        if is_gevent_monkey_patched():
+            raise RuntimeError('DPark do not support gevent.')
+
         self.master = master
         self.initialized = False
         self.started = False
+        self.web_port = None
+        self.webui_url = None
+        self.data_limit = None
+        self.scheduler = None
+        self.is_local = True
         self.defaultParallelism = 2
+        self.defaultMinSplits = 2
+        self.is_dstream = False
 
     def init(self):
         if self.initialized:
             return
 
-        options = parse_options()
-        self.options = options
+        register_sighandlers()
 
-        master = self.master or options.master
+        cls = self.__class__
+        options = cls.options
+        if options is None:
+            options = cls.options = parse_options()
+
+        try:
+            import dpark.web
+            from dpark.web.ui import create_app
+            app = create_app(self)
+            self.web_port = dpark.web.start(app)
+            self.webui_url = 'http://%s:%s' % (
+                socket.gethostname(),
+                self.web_port
+            )
+            logger.info('start listening on Web UI: %s', self.webui_url)
+        except ImportError as e:
+            self.webui_url = None
+            logger.info('no web server created as %s', e)
+
+        origin_master = master = self.master or options.master
         if master == 'local':
+            logger.info("use local scheduler: %s", master)
             self.scheduler = LocalScheduler()
-            self.isLocal = True
+            self.is_local = True
         elif master == 'process':
+            logger.info("use process scheduler: %s", master)
             self.scheduler = MultiProcessScheduler(options.parallel)
-            self.isLocal = False
+            self.is_local = False
         else:
             if master == 'mesos':
                 master = conf.MESOS_MASTER
+            else:
+                master = conf.MESOS_MASTERS.get(master, master)
 
             if master.startswith('mesos://'):
                 if '@' in master:
-                    master = master[master.rfind('@')+1:]
+                    master = master[master.rfind('@') + 1:]
                 else:
-                    master = master[master.rfind('//')+2:]
+                    master = master[master.rfind('//') + 2:]
             elif master.startswith('zoo://'):
                 master = 'zk' + master[3:]
 
             if ':' not in master:
                 master += ':5050'
-            self.scheduler = MesosScheduler(master, options)
-            self.isLocal = False
+            self.scheduler = MesosScheduler(
+                master, options, webui_url=self.webui_url
+            )
+            self.data_limit = 1024 * 1024  # 1MB
+            self.is_local = False
+            logger.info("use mesos scheduler: %s", master)
 
         self.master = master
 
@@ -92,10 +187,15 @@ class DparkContext(object):
         self.defaultMinSplits = max(self.defaultParallelism, 2)
 
         self.initialized = True
+        self.scheduler.is_dstream = self.is_dstream
+
+        logger.info("DparkContext initialized, use master %s -> %s, default_rddconf = %s",
+                    origin_master, master,
+                    conf.default_rddconf)
 
     @staticmethod
     def setLogLevel(level):
-        logging.getLogger('dpark').setLevel(level)
+        get_logger('dpark').setLevel(level)
 
     def newShuffleId(self):
         self.nextShuffleId += 1
@@ -114,22 +214,23 @@ class DparkContext(object):
         self.init()
         if isinstance(path, (list, tuple)):
             return self.union([self.textFile(p, ext, followLink, maxdepth, cls, *ka, **kws)
-                for p in path])
+                               for p in path])
 
         path = os.path.realpath(path)
-        def create_rdd(cls, path, *ka, **kw):
-            if cls is TextFileRDD:
-                if path.endswith('.bz2'):
-                    return BZip2FileRDD(self, path, *ka, **kw)
-                elif path.endswith('.gz'):
-                    return GZipFileRDD(self, path, *ka, **kw)
-            return cls(self, path, *ka, **kw)
+
+        def create_rdd(_cls, _path, *_ka, **_kw):
+            if _cls is TextFileRDD:
+                if _path.endswith('.bz2'):
+                    return BZip2FileRDD(self, _path, *_ka, **_kw)
+                elif _path.endswith('.gz'):
+                    return GZipFileRDD(self, _path, *_ka, **_kw)
+            return _cls(self, _path, *_ka, **_kw)
 
         if os.path.isdir(path):
             paths = []
-            for root,dirs,names in walk(path, followlinks=followLink):
+            for root, dirs, names in walk(path, followlinks=followLink):
                 if maxdepth > 0:
-                    depth = len(filter(None, root[len(path):].split('/'))) + 1
+                    depth = len([_f for _f in root[len(path):].split('/') if _f]) + 1
                     if depth > maxdepth:
                         break
                 for n in sorted(names):
@@ -143,17 +244,20 @@ class DparkContext(object):
                         dirs.remove(d)
 
             rdds = [create_rdd(cls, p, *ka, **kws)
-                     for p in paths]
+                    for p in paths]
             return self.union(rdds)
         else:
             return create_rdd(cls, path, *ka, **kws)
+
+    def tfRecordsFile(self, path, *args, **kwargs):
+        return self.textFile(path, cls=TfrecordsRDD, *args, **kwargs)
 
     def partialTextFile(self, path, begin, end, splitSize=None, numSplits=None):
         self.init()
         return PartialTextFileRDD(self, path, begin, end, splitSize, numSplits)
 
     def bzip2File(self, *args, **kwargs):
-        "deprecated"
+        """deprecated"""
         logger.warning("bzip2File() is deprecated, use textFile('xx.bz2') instead")
         return self.textFile(cls=BZip2FileRDD, *args, **kwargs)
 
@@ -175,41 +279,80 @@ class DparkContext(object):
         for root, dirs, names in walk(dpath):
             if '.field_names' in names:
                 p = os.path.join(root, '.field_names')
-                fields = open(p).read().split('\t')
+                with open(p) as f:
+                    fields = f.read().split('\t')
+
                 break
         else:
             raise Exception("no .field_names found in %s" % path)
         return self.tableFile(path, **kwargs).asTable(fields)
 
-    def beansdb(self, path, depth=None, filter=None, fullscan=False, raw=False, only_latest=False):
-        "(Key, (Value, Version, Timestamp)) data in beansdb"
-        self.init()
-        if isinstance(path, (tuple, list)):
-            return self.union([self.beansdb(p, depth, filter, fullscan, raw, only_latest)
-                    for p in path])
+    def beansdb(self, path, depth=None, filter=None,
+                fullscan=False, raw=False, only_latest=False):
+        """(Key, (VALUE, Version, Timestamp)) data in beansdb
 
-        path = os.path.realpath(path)
-        assert os.path.exists(path), "%s no exists" % path
-        if os.path.isdir(path):
-            subs = []
-            if not depth:
-                subs = [os.path.join(path, n) for n in os.listdir(path) if n.endswith('.data')]
-            if subs:
-                rdd = self.union([BeansdbFileRDD(self, p, filter, fullscan, True)
-                        for p in subs])
-            else:
-                subs = [os.path.join(path, '%x'%i) for i in range(16)]
-                rdd = self.union([self.beansdb(p, depth and depth-1, filter, fullscan, True, only_latest)
-                        for p in subs if os.path.exists(p)])
-                only_latest = False
+        Data structure:
+            REC = (Key, TRIPLE)
+            TRIPLE = (VALUE, Version, Timestamp)
+            VALUE = RAW_VALUE | REAL_VALUE
+            RAW_VALUE = (flag, BYTES_VALUE)
+
+        Args:
+            path: beansdb data path
+            filter: used to filter key
+            depth: choice = [None, 0, 1, 2]. e.g. depth=2 assume dir tree like:
+                    'path/[0-F]/[0-F]/%03d.data'
+                If depth is None, dpark will guess.
+            fullscan: NOT use index files, which contain (key, pos_in_datafile).
+                pairs.
+                Better use fullscan unless the filter selectivity is low.
+                Effect of using index:
+                    inefficient random access
+                    one split(task) for each file instead of each moosefs chunk
+
+                Omitted if filter is None.
+            raw: VALUE = RAW_VALUE if raw else REAL_VALUE.
+            only_latest: for each key, keeping the REC with the largest
+                Timestamp. This will append a reduceByKey RDD.
+                Need this because online beansdb data is log structured.
+        """
+
+        key_filter = filter
+
+        self.init()
+        if key_filter is None:
+            fullscan = True
+        if isinstance(path, (tuple, list)):
+            rdd = self.union([self.beansdb(p, depth, key_filter, fullscan,
+                                           raw=True, only_latest=False)
+                              for p in path])
         else:
-            rdd = BeansdbFileRDD(self, path, filter, fullscan, True)
+            path = os.path.realpath(path)
+            assert os.path.exists(path), "%s no exists" % path
+            if os.path.isdir(path):
+                subs = []
+                if not depth:
+                    subs = [os.path.join(path, n) for n in os.listdir(path)
+                            if n.endswith('.data')]
+                if subs:
+                    rdd = self.union([BeansdbFileRDD(self, p, key_filter,
+                                                     fullscan, raw=True)
+                                      for p in subs])
+                else:
+                    subs = [os.path.join(path, '%x' % i) for i in range(16)]
+                    rdd = self.union([self.beansdb(p, depth and depth - 1, key_filter,
+                                                   fullscan, raw=True, only_latest=False)
+                                      for p in subs if os.path.exists(p)])
+            else:
+                rdd = BeansdbFileRDD(self, path, key_filter, fullscan, raw)
 
         # choose only latest version
         if only_latest:
-            rdd = rdd.reduceByKey(lambda v1,v2: v1[2] > v2[2] and v1 or v2, int(ceil(len(rdd) / 4)))
+            num_splits = min(int(ceil(len(rdd) / 4)), 800)
+            rdd = rdd.reduceByKey(lambda v1, v2: v1[2] > v2[2] and v1 or v2,
+                                  numSplits=num_splits)
         if not raw:
-            rdd = rdd.mapValue(lambda (v,ver,t): (restore_value(*v), ver, t))
+            rdd = rdd.mapValue(lambda v_ver_t: (restore_value(*v_ver_t[0]), v_ver_t[1], v_ver_t[2]))
         return rdd
 
     def union(self, rdds):
@@ -227,42 +370,40 @@ class DparkContext(object):
         return Broadcast(v)
 
     def start(self):
+        def shutdown():
+            self.stop()
+            try:
+                import dpark.web
+                dpark.web.stop(self.web_port)
+            except ImportError:
+                pass
+
         if self.started:
             return
 
         self.init()
 
-        env.start(True, environ={'is_local': self.isLocal})
+        env.start()
         self.scheduler.start()
         self.started = True
-        atexit.register(self.stop)
+        _shutdown_handlers.append(shutdown)
 
-        def handler(signm, frame):
-            logger.error("got signal %d, exit now", signm)
-            self.scheduler.shutdown()
-        try:
-            signal.signal(signal.SIGTERM, handler)
-            signal.signal(signal.SIGHUP, handler)
-            signal.signal(signal.SIGABRT, handler)
-            signal.signal(signal.SIGQUIT, handler)
-        except: pass
-
-        try:
-            from rfoo.utils import rconsole
-            rconsole.spawn_server(locals(), 0)
-        except ImportError:
-            pass
+        spawn_rconsole(locals())
 
     def runJob(self, rdd, func, partitions=None, allowLocal=False):
         self.start()
 
+        success = False
         if partitions is None:
-            partitions = range(len(rdd))
+            partitions = list(range(len(rdd)))
         try:
             gc.disable()
             for it in self.scheduler.runJob(rdd, func, partitions, allowLocal):
                 yield it
+            success = True
         finally:
+            if not success:
+                logger.critical('Framework failed')
             gc.collect()
             gc.enable()
 
@@ -311,41 +452,39 @@ class Parser(optparse.OptionParser):
             else:
                 return
 
+
 parser = Parser(usage="Usage: %prog [options] [args]")
+
 
 def add_default_options():
     group = optparse.OptionGroup(parser, "Dpark Options")
 
     group.add_option("-m", "--master", type="string", default="local",
-            help="master of Mesos: local, process, host[:port], or mesos://")
-#    group.add_option("-n", "--name", type="string", default="dpark",
-#            help="job name")
+                     help="master of Mesos: local, process, host[:port], or mesos://")
     group.add_option("-p", "--parallel", type="int", default=0,
-            help="number of processes")
+                     help="number of processes")
 
     group.add_option("-c", "--cpus", type="float", default=1.0,
-            help="cpus used per task")
+                     help="cpus used per task")
     group.add_option("-M", "--mem", type="string",
-            help="memory used per task (e.g. 300m, 1g), default unit is 'm'")
+                     help="memory used per task (e.g. 300m, 1g), default unit is 'm'")
     group.add_option("-g", "--group", type="string", default="",
-            help="which group of machines")
+                     help="which group of machines")
     group.add_option("--err", type="float", default=0.0,
-            help="acceptable ignored error record ratio (0.01%)")
+                     help="acceptable ignored error record ratio (0.01%)")
     group.add_option("--checkpoint_dir", type="string", default="",
-            help="shared dir to keep checkpoint of RDDs")
+                     help="shared dir to keep checkpoint of RDDs")
 
-    group.add_option("--conf", type="string",
-            help="path for configuration file")
-    group.add_option("--self", action="store_true",
-            help="user self as exectuor")
+    group.add_option("--color", action="store_true")
+    group.add_option("--no-color", action="store_false", dest='color')
+
     group.add_option("--profile", action="store_true",
-            help="do profiling")
-    group.add_option("--keep-order", action="store_true",
-            help="deprecated, always keep order")
+                     help="do profiling")
+    group.add_option("--role", type="string", default="")
 
-    group.add_option("-I","--image", type="string",
+    group.add_option("-I", "--image", type="string",
                      help="image name for Docker")
-    group.add_option("-V","--volumes", type="string",
+    group.add_option("-V", "--volumes", type="string",
                      help="volumes to mount into Docker")
 
     parser.add_option_group(group)
@@ -353,27 +492,23 @@ def add_default_options():
     parser.add_option("-q", "--quiet", action="store_true")
     parser.add_option("-v", "--verbose", action="store_true")
 
+
 add_default_options()
 
 
 def parse_options():
     options, args = parser.parse_args()
-    setup_conf(options)
+    if options.mem is None:
+        options.mem = conf.MEM_PER_TASK
+    else:
+        options.mem = memory_str_to_mb(options.mem)
 
     options.logLevel = (options.quiet and logging.ERROR
-                  or options.verbose and logging.DEBUG or logging.INFO)
+                        or options.verbose and logging.DEBUG or logging.INFO)
+    if options.color is None:
+        options.color = getattr(sys.stderr, 'isatty', lambda: False)()
 
-    log_format = '%(asctime)-15s [%(levelname)s] [%(name)-9s] %(message)s'
-    logging.basicConfig(format=log_format, level=options.logLevel)
-
-    logger = logging.getLogger('dpark')
-    logger.propagate = False
-
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(log_format))
-
-    logger.addHandler(handler)
-    logger.setLevel(max(options.logLevel, logger.level))
+    init_dpark_logger(options.logLevel, use_color=options.color)
 
     if any(arg.startswith('-') for arg in args):
         logger.warning('unknown args found in command-line: %s', ' '.join(args))

@@ -1,17 +1,20 @@
+from __future__ import absolute_import
 import os
 import zlib
 import types
 import socket
 import struct
 import marshal
-import cPickle
-from lz4 import compress, decompress
 from dpark.rdd import RDD, MultiSplit, TextFileRDD, Split, ParallelCollection, cached
-from dpark.util import chain, atomic_file
-from dpark.moosefs import walk
-from dpark.bitindex import Bloomfilter, BitIndex
+from dpark.utils import chain, atomic_file
+from dpark.file_manager import walk
+from dpark.utils.bitindex import Bloomfilter, BitIndex
 from dpark.serialize import dumps, loads
 from dpark.dependency import OneToOneDependency, OneToRangeDependency
+from contextlib import closing
+import six
+from six.moves import map, range, zip, cPickle
+from dpark.utils.lz4wrapper import compress, decompress
 
 '''
 Strip Format:
@@ -44,11 +47,13 @@ MAX_BIT_INDEX_SIZE = 1 << 14
 BITMAP_INDEX = 0
 BLOOMFILTER_INDEX = 1
 
+
 class NamedTuple(object):
     _fields = []
     _values = ()
+
     def __init__(self, fields, values):
-        if isinstance(fields, types.StringTypes):
+        if isinstance(fields, (str,)):
             fields = fields.replace(',', ' ').split()
 
         fields = list(fields)
@@ -88,6 +93,7 @@ class NamedTuple(object):
     def __contains__(self, item):
         return item in self._values
 
+
 class AdaptiveIndex(object):
     def __init__(self):
         self.index = {}
@@ -122,19 +128,21 @@ class AdaptiveIndex(object):
         if self.index_type == BITMAP_INDEX:
             return chain(v.positions() for k, v in self.index.items() if fun(k))
 
+
 class TabularSplit(Split):
     def __init__(self, index, rdd, sp):
         self.index = index
         self.rdd = rdd
         self.split = sp
 
+
 class TabularRDD(RDD):
-    def __init__(self, ctx, path, fields = None, taskMemory=None):
+    def __init__(self, ctx, path, fields=None, taskMemory=None):
         RDD.__init__(self, ctx)
         if taskMemory:
             self.mem = taskMemory
 
-        if isinstance(path, basestring):
+        if isinstance(path, six.string_types):
             files = self._get_files(path)
         else:
             files = chain(self._get_files(p) for p in path)
@@ -148,16 +156,15 @@ class TabularRDD(RDD):
                 i += 1
         self._dependencies = [OneToOneDependency(rdd) for rdd in rdds]
         self.repr_name = '<%s %d %s...>' % (self.__class__.__name__, len(rdds),
-                                  ','.join(str(rdd) for rdd in rdds[:1]))
+                                            ','.join(str(rdd) for rdd in rdds[:1]))
         self._preferred_locs = {}
         for split in self._splits:
             self._preferred_locs[split] = split.rdd.preferredLocations(split.split)
 
-
     def _get_files(self, path):
         path = os.path.realpath(path)
         if os.path.isdir(path):
-            for root,dirs,names in walk(path):
+            for root, dirs, names in walk(path):
                 for n in sorted(names):
                     if not n.startswith('.'):
                         yield os.path.join(root, n)
@@ -170,6 +177,7 @@ class TabularRDD(RDD):
 
     def filterByIndex(self, **kw):
         return FilteredByIndexRDD(self, kw)
+
 
 class FilteredByIndexRDD(RDD):
     def __init__(self, rdd, filters):
@@ -200,16 +208,17 @@ class FilteredByIndexRDD(RDD):
 
     def _get_splits(self):
         filters = self.filters
+
         def _filter(v):
-            path, splits = v
-            result_set = set(sp.split.begin / STRIPE_SIZE for sp in splits)
+            path, ids = v
+            result_set = set(ids)
             with open(path, 'rb') as f:
                 f.seek(-8, 2)
                 footer_fields_size, footer_indices_size = struct.unpack('II', f.read(8))
-                f.seek(-8 -footer_fields_size -footer_indices_size, 2)
+                f.seek(-8 - footer_fields_size - footer_indices_size, 2)
                 indices = cPickle.loads(zlib.decompress(f.read(footer_indices_size)))
                 _fields = marshal.loads(decompress(f.read(footer_fields_size)))
-                for k, v in filters.iteritems():
+                for k, v in six.iteritems(filters):
                     result = set()
                     if k not in _fields:
                         raise RuntimeError('%s is not in fields!' % k)
@@ -229,31 +238,34 @@ class FilteredByIndexRDD(RDD):
                             v = [v]
 
                         for vv in v:
-                            for id in result_set:
-                                if index.get(vv, id):
-                                    result.add(id)
-
-		    result_set &= result
-
-            for sp in splits:
-                id = sp.split.begin / STRIPE_SIZE
-                if id in result:
-                    yield sp
+                            for _id in result_set:
+                                if index.get(vv, _id):
+                                    result.add(_id)
+            return path, result
 
         sp_dict = {}
         for sp in self.rdd.splits:
             path = sp.rdd.path
+            _id = sp.split.begin / STRIPE_SIZE
             if path not in sp_dict:
-                sp_dict[path] = [sp]
+                sp_dict[path] = [_id]
             else:
-                sp_dict[path].append(sp)
+                sp_dict[path].append(_id)
 
-        rdd = ParallelCollection(self.ctx, sp_dict.items(), len(sp_dict))
-        return rdd.flatMap(_filter).collect()
+        rdd = ParallelCollection(self.ctx, list(sp_dict.items()), len(sp_dict))
+        path_ids_filter = dict(rdd.map(_filter).collect())
+
+        splits = []
+        for sp in self.rdd.splits:
+            path = sp.rdd.path
+            _id = sp.split.begin / STRIPE_SIZE
+            if _id in path_ids_filter[path]:
+                splits.append(sp)
+        return splits
 
     def compute(self, split):
         for t in self.rdd.iterator(split):
-            for k, v in self.filters.iteritems():
+            for k, v in six.iteritems(self.filters):
                 value = getattr(t, k)
                 if isinstance(v, types.FunctionType):
                     if not v(value):
@@ -268,17 +280,18 @@ class FilteredByIndexRDD(RDD):
             else:
                 yield t
 
+
 class TabularFileRDD(TextFileRDD):
-    def __init__(self, ctx, path, fields = None):
-        TextFileRDD.__init__(self, ctx, path, splitSize = STRIPE_SIZE)
-        if isinstance(fields, basestring):
+    def __init__(self, ctx, path, fields=None):
+        TextFileRDD.__init__(self, ctx, path, splitSize=STRIPE_SIZE)
+        if isinstance(fields, six.string_types):
             fields = fields.replace(',', ' ').split()
 
-        self.fields = map(str, fields) if fields is not None else None
+        self.fields = list(map(str, fields)) if fields is not None else None
 
     def compute(self, split):
-        with self.open_file() as f:
-            f.seek(-8,2)
+        with closing(self.open_file()) as f:
+            f.seek(-8, 2)
             footer_fields_size, footer_indices_size = struct.unpack('II', f.read(8))
             footer_offset = self.size - 8 - footer_fields_size - footer_indices_size
             footer_fields_offset = self.size - 8 - footer_fields_size
@@ -292,7 +305,7 @@ class TabularFileRDD(TextFileRDD):
             _fields = marshal.loads(decompress(f.read(footer_fields_size)))
 
             if self.fields is None:
-                field_ids = range(len(_fields))
+                field_ids = list(range(len(_fields)))
                 field_names = _fields
             else:
                 field_names = []
@@ -319,6 +332,7 @@ class TabularFileRDD(TextFileRDD):
             for r in zip(*content):
                 yield NamedTuple(field_names, r)
 
+
 class OutputTabularRDD(RDD):
     def __init__(self, rdd, path, field_names, indices=None, numSplits=None):
         RDD.__init__(self, rdd.ctx)
@@ -329,14 +343,14 @@ class OutputTabularRDD(RDD):
             raise RuntimeError('path already exists: %s' % path)
 
         os.makedirs(path)
-        if isinstance(field_names, basestring):
+        if isinstance(field_names, six.string_types):
             field_names = field_names.replace(',', ' ').split()
 
         if len(set(field_names)) != len(field_names):
             raise ValueError('duplicated field names')
 
-        self.fields = map(str, field_names)
-        if isinstance(indices, types.StringTypes):
+        self.fields = list(map(str, field_names))
+        if isinstance(indices, (str,)):
             indices = indices.replace(',', ' ').split()
 
         self.indices = set()
@@ -351,10 +365,10 @@ class OutputTabularRDD(RDD):
         prev_splits = len(rdd)
         numSplits = min(numSplits or prev_splits, prev_splits)
         self.numSplits = min(numSplits, prev_splits)
-        s = [int(round(1.0*prev_splits/numSplits*i)) for i in xrange(numSplits + 1)]
-        self._splits = [MultiSplit(i, rdd.splits[s[i]:s[i+1]]) for i in xrange(numSplits)]
-        self._dependencies = [OneToRangeDependency(rdd, int(prev_splits/numSplits),
-                                                  prev_splits)]
+        s = [int(round(1.0 * prev_splits / numSplits * i)) for i in range(numSplits + 1)]
+        self._splits = [MultiSplit(i, rdd.splits[s[i]:s[i + 1]]) for i in range(numSplits)]
+        self._dependencies = [OneToRangeDependency(rdd, int(prev_splits / numSplits),
+                                                   prev_splits)]
         self.repr_name = '<OutputTabularRDD %s %s>' % (path, rdd)
 
     def _clear_dependencies(self):
@@ -419,4 +433,3 @@ class OutputTabularRDD(RDD):
             f.write(struct.pack('II', len(footer_fields), len(footer_indices)))
 
         yield path
-

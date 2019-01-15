@@ -1,7 +1,9 @@
+from __future__ import absolute_import
 from operator import add
 import copy
 
 from dpark.serialize import load_func, dump_func
+
 
 class AccumulatorParam:
     def __init__(self, zero, addInPlace):
@@ -12,18 +14,19 @@ class AccumulatorParam:
         return dump_func(self.addInPlace), self.zero
 
     def __setstate__(self, state):
-        add, self.zero = state
-        self.addInPlace = load_func(add)
+        add_, self.zero = state
+        self.addInPlace = load_func(add_)
+
 
 numAcc = AccumulatorParam(0, add)
-listAcc = AccumulatorParam([], lambda x,y:x.extend(y) or x)
-mapAcc = AccumulatorParam({}, lambda x,y:x.update(y) or x)
-setAcc = AccumulatorParam(set(), lambda x,y:x.update(y) or x)
+listAcc = AccumulatorParam([], lambda x, y: x.extend(y) or x)
+mapAcc = AccumulatorParam({}, lambda x, y: x.update(y) or x)
+setAcc = AccumulatorParam(set(), lambda x, y: x.update(y) or x)
 
 
 class Accumulator:
     def __init__(self, initialValue=0, param=numAcc):
-        self.id = self.newId()
+        self.id = self.new_id()
         if param is None:
             param = numAcc
         self.param = param
@@ -48,13 +51,15 @@ class Accumulator:
         self.register(self, False)
 
     nextId = 0
+
     @classmethod
-    def newId(cls):
+    def new_id(cls):
         cls.nextId += 1
         return cls.nextId
 
     originals = {}
     localAccums = {}
+
     @classmethod
     def register(cls, acc, original):
         if original:
@@ -70,20 +75,18 @@ class Accumulator:
 
     @classmethod
     def values(cls):
-        v = dict((id, accum.value) for id,accum in cls.localAccums.items())
+        v = dict((id_, accum.value) for id_, accum in cls.localAccums.items())
         cls.clear()
         return v
 
     @classmethod
     def merge(cls, values):
-        for id, value in values.items():
-            cls.originals[id].add(value)
+        for id_, value in values.items():
+            cls.originals[id_].add(value)
+
 
 ReadBytes = Accumulator()
 WriteBytes = Accumulator()
-
-RemoteReadBytes = Accumulator()
-LocalReadBytes = Accumulator()
 
 CacheHits = Accumulator()
 CacheMisses = Accumulator()

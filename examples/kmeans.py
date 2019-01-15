@@ -1,12 +1,21 @@
 #!/usr/bin/env python
+from __future__ import absolute_import
+from __future__ import print_function
 import sys, os, os.path
+from six.moves import map
+from six.moves import range
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import random
-import dpark
+from dpark import DparkContext
 from vector import Vector
 
+dpark = DparkContext()
+
+
 def parseVector(line):
-    return Vector(map(float, line.strip().split(' ')))
+    return Vector(list(map(float, line.strip().split(' '))))
+
 
 def closestCenter(p, centers):
     bestDist = p.squaredDist(centers[0])
@@ -28,13 +37,13 @@ if __name__ == '__main__':
     points = dpark.textFile('kmeans_data.txt').map(parseVector).cache()
 
     for it in range(IT):
-        print 'iteration', it
-        mappedPoints = points.map(lambda p:(closestCenter(p, centers), (p, 1)))
+        print('iteration', it)
+        mappedPoints = points.map(lambda p: (closestCenter(p, centers), (p, 1)))
         ncenters = mappedPoints.reduceByKey(
-                lambda (s1,c1),(s2,c2): (s1+s2,c1+c2)
-            ).map(
-                lambda (id, (sum, count)): (id, sum/count)
-            ).collectAsMap()
+            lambda (s1, c1), (s2, c2): (s1 + s2, c1 + c2)
+        ).map(
+            lambda id_sum_count: (id_sum_count[0], id_sum_count[1][0] / id_sum_count[1][1])
+        ).collectAsMap()
 
         updated = False
         for i in ncenters:
@@ -43,6 +52,6 @@ if __name__ == '__main__':
                 updated = True
         if not updated:
             break
-        print centers
+        print(centers)
 
-    print 'final', centers
+    print('final', centers)

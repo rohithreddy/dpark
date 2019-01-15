@@ -1,19 +1,24 @@
+from __future__ import absolute_import
+from __future__ import print_function
 import os
-import multiprocessing
-import logging
 import marshal
-import cPickle
+from six.moves import cPickle
 import shutil
 import struct
-import urllib
 
 import msgpack
 
 from dpark.env import env
-from dpark.util import mkdir_p, atomic_file
+from dpark.serialize import marshalable
+from dpark.utils import mkdir_p, atomic_file
+from dpark.utils.log import get_logger
 from dpark.tracker import GetValueMessage, AddItemMessage, RemoveItemMessage
+from six.moves import map
+from six.moves import range
+from six.moves import urllib
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
 
 class Cache:
     data = {}
@@ -32,6 +37,7 @@ class Cache:
 
     def clear(self):
         self.data.clear()
+
 
 class DiskCache(Cache):
     def __init__(self, tracker, path):
@@ -60,7 +66,11 @@ class DiskCache(Cache):
 
         serve_uri = locs[-1]
         uri = '%s/cache/%s' % (serve_uri, os.path.basename(p))
-        f = urllib.urlopen(uri)
+        try:
+            f = urllib.request.urlopen(uri)
+        except IOError:
+            logger.warning('urlopen cache uri %s failed', uri)
+            raise
         if f.code == 404:
             logger.warning('load from cache %s failed', uri)
             self.tracker.removeHost(rdd_id, index, serve_uri)
@@ -78,15 +88,15 @@ class DiskCache(Cache):
     def clear(self):
         try:
             shutil.rmtree(self.root)
-        except OSError, e:
+        except OSError as e:
             pass
 
     def load(self, f):
         count, = struct.unpack("I", f.read(4))
         if not count: return
         unpacker = msgpack.Unpacker(f, use_list=False)
-        for i in xrange(count):
-            _type, data = unpacker.next()
+        for i in range(count):
+            _type, data = next(unpacker)
             if _type == 0:
                 yield marshal.loads(data)
             else:
@@ -98,14 +108,15 @@ class DiskCache(Cache):
         with atomic_file(path) as f:
             c = 0
             f.write(struct.pack("I", c))
-            try_marshal = True
+            # check is marshalable and compatible with broadcast
+            can_marshal = marshalable(items)
             for v in items:
-                if try_marshal:
+                if can_marshal:
                     try:
                         r = 0, marshal.dumps(v)
                     except Exception:
                         r = 1, cPickle.dumps(v, -1)
-                        try_marshal = False
+                        can_marshal = False
                 else:
                     r = 1, cPickle.dumps(v, -1)
                 f.write(msgpack.packb(r))
@@ -113,8 +124,8 @@ class DiskCache(Cache):
                 yield v
 
             bytes = f.tell()
-            if bytes > 10<<20:
-                logger.warning("cached result is %dMB (larger than 10MB)", bytes>>20)
+            if bytes > 10 << 20:
+                logger.warning("cached result is %dMB (larger than 10MB)", bytes >> 20)
             # count
             f.seek(0)
             f.write(struct.pack("I", c))
@@ -164,12 +175,13 @@ class BaseCacheTracker(object):
     def stop(self):
         self.clear()
 
+
 class CacheTracker(BaseCacheTracker):
     def __init__(self):
         cachedir = os.path.join(env.get('WORKDIR')[0], 'cache')
         self.cache = DiskCache(self, cachedir)
         self.client = env.trackerClient
-        if env.isMaster:
+        if env.trackerServer is not None:
             self.locs = env.trackerServer.locs
         self.rdds = {}
 
@@ -180,7 +192,7 @@ class CacheTracker(BaseCacheTracker):
         result = {}
         for rdd_id, partitions in self.rdds.items():
             result[rdd_id] = [self.locs.get('cache:%s-%s' % (rdd_id, index), [])
-                    for index in xrange(partitions)]
+                              for index in range(partitions)]
 
         return result
 
@@ -190,7 +202,8 @@ class CacheTracker(BaseCacheTracker):
                 h = uri.split(':')[1].rsplit('/', 1)[-1]
                 return h
             return ''
-        return map(parse_hostname, self.locs.get('cache:%s-%s' % (rdd_id, index), []))
+
+        return list(map(parse_hostname, self.locs.get('cache:%s-%s' % (rdd_id, index), [])))
 
     def getCacheUri(self, rdd_id, index):
         return self.client.call(GetValueMessage('cache:%s-%s' % (rdd_id, index)))
@@ -223,18 +236,20 @@ class CacheTracker(BaseCacheTracker):
 
 
 def test():
+    import logging
     logging.basicConfig(level=logging.DEBUG)
     from dpark.context import DparkContext
     dc = DparkContext("local")
     dc.start()
-    nums = dc.parallelize(range(100), 10)
-    tracker = CacheTracker(True)
+    nums = dc.parallelize(list(range(100)), 10)
+    tracker = CacheTracker()
     tracker.registerRDD(nums.id, len(nums))
     split = nums.splits[0]
-    print list(tracker.getOrCompute(nums, split))
-    print list(tracker.getOrCompute(nums, split))
-    print tracker.getLocationsSnapshot()
+    print(list(tracker.getOrCompute(nums, split)))
+    print(list(tracker.getOrCompute(nums, split)))
+    print(tracker.getLocationsSnapshot())
     tracker.stop()
+
 
 if __name__ == '__main__':
     test()

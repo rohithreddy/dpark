@@ -1,6 +1,10 @@
+from __future__ import absolute_import
+from __future__ import print_function
+import six
 import sys
 import unittest
 import timeit
+from flaky import flaky
 from dpark.serialize import dump_closure, load_closure, dumps, loads
 from contextlib import contextmanager
 
@@ -10,9 +14,9 @@ MAIN = sys.modules['__main__']
 @contextmanager
 def main_environ(exec_str):
     org = MAIN.__dict__.copy()
-    exec exec_str in MAIN.__dict__
+    exec(exec_str, MAIN.__dict__)
     yield
-    for k in MAIN.__dict__.keys():
+    for k in list(MAIN.__dict__.keys()):
         if k not in org:
             del MAIN.__dict__[k]
 
@@ -21,7 +25,7 @@ class TestSerialize(unittest.TestCase):
 
     def testNameError(self):
         def foo():
-            print x
+            print(x)
 
         dumped_func = dump_closure(foo)
         func = load_closure(dumped_func)
@@ -29,14 +33,18 @@ class TestSerialize(unittest.TestCase):
         self.assertRaises(NameError, func)
         x = 10
 
+    @flaky
     def test_big_object_performance(self):
         t1 = max(timeit.repeat('dumps(d)',
                                'from dpark.serialize import dumps;'
-                               'd = {(str(i),):i for i in xrange(10000)}',
+                               'd = {(str(i),):i for i in range(10000)}',
                                repeat=3, number=1))
-        t2 = max(timeit.repeat('dumps(d, -1)',
-                               'from pickle import dumps;'
-                               'd = {(str(i),):i for i in xrange(10000)}',
+        _import = ('from pickle import dumps;'
+                   if six.PY2
+                   else 'from pickle import _dumps as dumps;')
+        t2 = max(timeit.repeat('dumps(d, 2)',
+                               _import +
+                               'd = {(str(i),):i for i in range(10000)}',
                                repeat=3, number=1))
         assert t1 < t2 * 2.5
 
@@ -45,7 +53,7 @@ class TestSerialize(unittest.TestCase):
         x = 10
 
         def foo():
-            return (x, y)
+            return x, y
 
         dumped_func = dump_closure(foo)
         func = load_closure(dumped_func)
@@ -55,10 +63,10 @@ class TestSerialize(unittest.TestCase):
     def testRandomSample(self):
         from random import sample, Random
         _sample = loads(dumps(sample))
-        assert _sample.im_class is sample.im_class
-        assert _sample.im_func is sample.im_func
-        assert isinstance(_sample.im_self, Random)
-        assert isinstance(sample.im_self, Random)
+        assert _sample.__self__.__class__ is sample.__self__.__class__
+        assert _sample.__func__ is sample.__func__
+        assert isinstance(_sample.__self__, Random)
+        assert isinstance(sample.__self__, Random)
 
     def testLocalMethod(self):
         exec_str = """
@@ -153,3 +161,19 @@ class _ClsWithSlots(object):
             f = MAIN._ClsWithSlots()
             _f = loads(dumps(f))
             assert _f.__slots__ == f.__slots__
+
+    def testOldStyleClass(self):
+        exec_str = """
+import csv
+
+class DumDialect(csv.Dialect):
+    delimiter = '\\t'
+    quotechar = '"'
+    escapechar = '\\\\'
+    doublequote = False
+    skipinitialspace = False
+    lineterminator = '\\n'
+    quoting = csv.QUOTE_MINIMAL
+"""
+        with main_environ(exec_str):
+            loads(dumps(MAIN.DumDialect))

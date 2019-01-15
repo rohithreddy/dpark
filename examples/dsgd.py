@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
-from dpark import _ctx as dpark
+from __future__ import absolute_import
+from __future__ import print_function
+from dpark import DparkContext
 from dpark.mutable_dict import MutableDict
 from random import shuffle
-import cPickle
+import six.moves.cPickle
 import numpy
+from six.moves import range
+from six.moves import zip
+
+dpark = DparkContext()
 
 with open('ab.mat') as f:
-    ori = cPickle.loads(f.read())
+    ori = six.moves.cPickle.loads(f.read())
 
 k = 50
 d = 20
@@ -20,14 +26,16 @@ v = V / d
 
 GAMMA = 0.02
 LAMBDA = 0.1
-STEP=0.9
-
+STEP = 0.9
 
 W = MutableDict(d)
 H = MutableDict(d)
 
 ori_b = dpark.broadcast(ori)
-def sgd((i, j)):
+
+
+def sgd(i_j):
+    (i, j) = i_j
     Wi = W.get(i)
     if Wi is None:
         Wi = numpy.random.rand(m, k)
@@ -39,14 +47,14 @@ def sgd((i, j)):
         H.put(j, Hj)
 
     ori = ori_b.value
-    Oij = ori[i*m:(i+1)*m, j*v:(j+1)*v]
+    Oij = ori[i * m:(i + 1) * m, j * v:(j + 1) * v]
 
-    for x in xrange(m):
-        for y in xrange(v):
+    for x in range(m):
+        for y in range(v):
             pred = Wi[x].dot(Hj[y])
             err = int(Oij[x][y]) - int(pred)
-            w = Wi[x] + GAMMA * (Hj[y]*err - LAMBDA*Wi[x])
-            h = Hj[y] + GAMMA * (Wi[x]*err - LAMBDA*Hj[y])
+            w = Wi[x] + GAMMA * (Hj[y] * err - LAMBDA * Wi[x])
+            h = Hj[y] + GAMMA * (Wi[x] * err - LAMBDA * Hj[y])
 
             Wi[x] = w
             Hj[y] = h
@@ -54,29 +62,32 @@ def sgd((i, j)):
     W.put(i, Wi)
     H.put(j, Hj)
 
-rdd = dpark.makeRDD(range(d))
+
+rdd = dpark.makeRDD(list(range(d)))
 rdd = rdd.cartesian(rdd).cache()
 
-def calc_err((i, j)):
+
+def calc_err(i_j):
+    (i, j) = i_j
     Wi = W.get(i)
     Hj = H.get(j)
 
     ori = ori_b.value
     Rij = Wi.dot(Hj.T)
-    Oij = ori[i*m:(i+1)*m, j*v:(j+1)*v]
+    Oij = ori[i * m:(i + 1) * m, j * v:(j + 1) * v]
     return ((Rij - Oij) ** 2).sum()
 
-J = range(d)
+
+J = list(range(d))
 while True:
-    for i in xrange(d):
-        dpark.makeRDD(zip(range(d), J), d).foreach(sgd)
+    for i in range(d):
+        dpark.makeRDD(list(zip(list(range(d)), J)), d).foreach(sgd)
         J = J[1:] + [J[0]]
 
     GAMMA *= STEP
     shuffle(J)
-    err = rdd.map(calc_err).reduce(lambda x,y:x+y)
-    rmse = numpy.sqrt(err/(M*V))
-    print rmse
+    err = rdd.map(calc_err).reduce(lambda x, y: x + y)
+    rmse = numpy.sqrt(err / (M * V))
+    print(rmse)
     if rmse < 0.01:
         break
-

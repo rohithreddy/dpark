@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Stages with G6 DAGRE</title>
+    <script src="https://gw.alipayobjects.com/os/antv/assets/g6/1.2.8/g6.min.js"></script>
+    <script src="https://gw.alipayobjects.com/os/antv/assets/lib/jquery-3.2.1.min.js"></script>
+    <script src="https://gw.alipayobjects.com/os/antv/assets/g6-plugins/1.0.9/g6-plugins.min.js"></script>
+
+    {#    <script type="text/javascript" src="../static/js/stage.js"></script>#}
+    <script src="{{ url_for('static', filename='js/stage.js', version='9') }}"></script>
+
+    <style type="text/css">
+        .row {
+            margin-bottom: 5px;
+            border: 1px solid seagreen;
+
+        }
+
+        .col {
+            display: inline-block;
+        }
+
+        .detail {
+            overflow-y: scroll;
+            border: 1px solid ;
+            height: 15pc;
+            float: top;
+        }
+    </style>
+</head>
+<body>
+
+<div id="top" style="height: 300px" class="row">
+    <div class="col" style="width:31%; float: left;">
+        stage detail
+        <pre id="stage_detail" class="detail" style="border-color: violet; ">
+            click a call node
+        </pre>
+    </div>
+     <div class="col" style="width:31%; float: left;">
+        callsite detail
+        <pre id="callsite_detail" class="detail" style=" border-color: blue">
+            click a call node
+        </pre>
+    </div>
+    <div id="explain_div" class="col" style="width:30%;"> 图例</div>
+
+</div>
+
+
+<div id="dags" style="height: 1200px" class="row">
+    <div id="stage_div" class="col" style="width:66%;"> stages</div>
+    <div id="call_div" class="col" style="width:30%; float: right;"> Dpark API callsites</div>
+</div>
+
+
+<script type="text/javascript">
+    "use strict";
+
+    // layout
+    var dagre1 = new G6.Plugins['layout.dagre']({
+        rankdir: 'LR',
+        nodesep: 100,
+        ranksep: 100
+    });
+
+    var dagre2 = new G6.Plugins['layout.dagre']({
+        rankdir: 'UD',
+        nodesep: 20,
+        ranksep: 20
+    });
+
+    G6.registNode('stageNode', stageNode);
+    G6.registNode('callNode', {
+        afterDraw: function (cfg, group) {
+            group.addShape('text', {
+                attrs: {
+                    x: cfg.x - cfg.size[0] / 2,
+                    y: cfg.y - cfg.size[1] / 2,
+                    fill: 'red',
+                    text: cfg.model.call_id
+                }
+            });
+        }
+    });
+
+    // net
+    var explain_net = new G6.Net({
+        id: 'explain_div',
+        mode: "none",
+        fitView: 'autoZoom',
+        height: 180
+    });
+
+    var explain_node = {
+        "type": "stage",
+        "id": "<stage_id>",
+        "label": "<stage_id>",
+        "rdds": [
+            {
+                "k": "<RDDName>[#split](#rdd)",
+                "v": "<caller id>"
+            }
+        ],
+        "prof_summary": [
+            ["task", "#all = #done + #running + #to_run"],
+            ["fail", "#all = #oom + #fetch + #run_timeout + #staging_timeout + #other"],
+            ['mem', 'init || [min, median, max] (of real used)'],
+            ['time', ' time_of_stage || [min, median, max] (of finished tasks) |  '],
+            ['speedup', 'speedup (of finished tasks)']
+        ],
+        "prof": {
+            'counters': {
+                "task": {
+                    "all": 100,
+                    "running": 20,
+                    "finished": 70
+                }
+            }
+        },
+        "is_output": true
+    };
+
+    explain_net.source([explain_node], []);
+    explain_net.node().shape("stageNode");
+    explain_net.render();
+
+    // net
+    var stage_net = new G6.Net({
+        id: 'stage_div',
+        mode: "none",
+        fitView: 'autoZoom',
+        plugins: [dagre1]
+    });
+
+    var call_net = new G6.Net({
+        id: 'call_div',
+        mode: "none",
+        fitView: 'autoZoom',
+        plugins: [dagre2]
+    });
+
+    stage_net.changeMode('drag');
+    call_net.changeMode('drag');
+
+    var data = {};
+
+    function on_load_fail(jqXHR, textStatus, errorThrown) {
+        alert("fail " + errorThrown);
+    }
+
+    function on_load_success(data_) {
+        data = data_;
+        reRender();
+    }
+
+    selected_call = "-1";
+    selected_stage = "-1";
+
+    function onClickCall(ev) {
+        // change var
+        var model = ev.item.get('model');
+        console.log(model);
+        selected_call = model.id;
+        $("#callsite_detail").html(JSON.stringify(model.detail, undefined, 4));
+        reRender();
+
+    }
+
+    function onClickStage(ev) {
+        var model = ev.item.get('model');
+        selected_stage = model.id;
+        $("#stage_detail").html(JSON.stringify(model, undefined, 4));
+        reRender();
+    }
+
+    var node_color = "gray";
+    var call_node_color_selected = "blue";
+    var stage_node_color_selected = "violet";
+
+
+    function reRenderCallNet() {
+        call_net.clear()
+        var calls = data.calls;
+        call_net.source(calls.nodes, calls.edges);
+        call_net.node().label("label").shape("callNode").color('id', function (v) {
+            if (v === selected_call) {
+                return call_node_color_selected
+            } else {
+                return node_color
+            }
+        });
+        call_net.edge().shape('arrow');
+        call_net.on('itemclick', onClickCall);
+        call_net.render();
+    }
+
+
+    function reRenderStageNet() {
+        stage_net.clear();
+        var stages = data.stages;
+        stage_net.source(stages.nodes, stages.edges);
+        stage_net.node().color('id', function (v) {
+            if (v === selected_stage) {
+                return stage_node_color_selected
+            } else {
+                return node_color
+            }
+        }).shape('type', function (v) {
+            if (v === "stage") {
+                return "stageNode"
+            } else {
+                return "callNode"
+            }
+        });
+        stage_net.edge().label('info').shape('arrow');
+        stage_net.on('itemclick', onClickStage);
+        stage_net.render();
+    }
+
+    function reRender() {
+        reRenderStageNet();
+        reRenderCallNet();
+    }
+
+    //$.getJSON("../../../../examples/ui/dag.json", on_load_success).fail(on_load_fail);
+    $.getJSON("data", on_load_success).fail(on_load_fail);
+
+
+</script>
+
+</body>
+</html>
